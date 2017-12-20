@@ -1,0 +1,511 @@
+#!/usr/bin/env python
+#
+import os, sys
+from lsmconfig import RDR,LDPATH,XRD,XRDADLER32,XRDCP,SRMPREFIX,LOGDIR,DFPATH, XRD_VMP
+try:
+    os.environ['LD_LIBRARY_PATH'] = LDPATH + ';' + os.environ['LD_LIBRARY_PATH']
+except KeyError:
+    os.environ['LD_LIBRARY_PATH'] = LDPATH
+
+os.environ['XROOTD_VMP'] = XRD_VMP
+#
+import stat, time, hashlib
+import optparse,re
+from subprocess import Popen, PIPE, STDOUT
+#
+#
+#Tunable parameters (permission of directories will also involve umask)
+PERM_DIR=0775
+PERM_FILE=0644
+####################################################################################
+# Class kXR_Flags
+# This is a convenience class to provide access to the meaning of Xrootd's flag
+# variable in response to a stat call
+#
+# taken from XProtocol/XProtocol.hh
+#
+class kXR_Flags:
+    def __init__(self):
+        #No, I don't undertand a bit field with a value of 0
+        self.file=0
+        self.executable=1
+        self.isDir=2
+        self.other=4
+        self.offline=8
+        self.readable=16
+        self.writable=32
+        self.poscpend=64
+####################################################################################
+# Class CommonStat
+# This is a class meant to unify accessing stat information from either posix paths
+# or from an Xrootd path
+#
+# An instnace is constructed from either an os.stat() call on a posix path
+# or the dictionary representing stat information avalable from Xrootd
+class CommonStat:
+    # save a copy of the passed in object
+    # initialize an instance of kXR_Flags()
+    def __init__(self,obj):
+        self.rawstat=obj
+        self.flagBits=kXR_Flags()
+
+    #Return the size from the stat information
+    def size(self):
+        if len(self.rawstat) == 10:
+            return self.rawstat.st_size
+        else:
+            return self.rawstat['size']
+
+    #provide a test to see if the stat'ed path is a directory
+    def isDir(self):
+        if len(self.rawstat) == 10:
+            return stat.S_ISDIR(self.rawstat.st_mode)
+        else:
+            if self.rawstat['flags'] & self.flagBits.isDir:
+                return True
+            else:
+                return False
+
+    #provide a test see if the stat'ed path is a regular file
+    def isReg(self):
+        if len(self.rawstat) == 10:
+            return stat.S_ISREG(self.rawstat.st_mode)
+        else:
+            if self.rawstat['flags'] & (self.flagBits.isDir + self.flagBits.other):
+                return False
+            else:
+                return True
+
+    #return the mod_time for the stat'ed path
+    def mtime(self):
+        if len(self.rawstat) == 10:
+            return self.rawstat.st_mtime
+        else:
+            return self.rawstat['mtime']
+
+####################################################################################
+# statPath(path)
+# gather information about a path
+# path can be either local or remote (Xrootd supplied)
+#
+def statPath(path):
+    if path.startswith(DFPATH):
+        stats = statPathXroot(path)
+    else:
+        stats = os.stat(path)
+                    
+    return CommonStat(stats)
+
+####################################################################################
+# statPathXroot(path)
+# 
+# try to perfom a stat operation on an Xroot path
+# Returned value is a dictionary containing attributes:
+#    id    Xrootd's ID of a path
+#    size  size reported by xrootd
+#    flags Xrootd's stat information
+#    mtime The modtime of the element
+# The values for each of these attributes is an int
+# If it decided that the provided path does not exist, then 
+# this will raise an OSError, similar to os.stat() 
+#
+def statPathXroot(path):
+    #
+    # Find out which dataservers have this path
+    # If a dir, then likely multiple
+    # Should I use locate and just use the first
+    # response?
+    # if path is a directory, we don't really care 
+    # beyond the fact.
+    #
+    # if path is a file, we might as well take the first one.
+    #
+    # The code doesn't do that now.  It finds all copies
+    # of path.
+    # We are also ignoring opaque (token) information at this point
+    # should we account for it?
+    #
+    dataservers=[]
+    location=re.compile("Location:\s+'([^']*)")
+    cmd=[XRD,RDR,'locateall', path]
+    try:
+        p=Popen(cmd,stdout=PIPE,stderr=STDOUT)
+        p.wait()
+    except:
+        # Couldn't run the commmand 
+        # How should I complain
+        # Bail 
+        fail(220,'Popen() failed for %s' % (' '.join(cmd)))
+    output=p.stdout.readlines()
+    if p.returncode:
+        # xrd command had an unknow problem
+        # bad library path?
+        # not a non-existent file
+        fail(220,'statPathXrootd(): xrd locateall failed:%s' % (''.join(output)))
+
+    dataserver=None
+    for line in output:
+        found=location.match(line)
+        #
+        # What to do with multiples?
+        # look at all, first, last
+        # 
+        # For now, only use first
+        #
+        if found:
+            dataserver=found.group(1)
+            break
+            #
+            # If we want to keep all
+            # dataservers.append( found.group(1) )
+
+    if not dataserver:
+        #Xrootd didn't know about path
+        #
+        raise OSError("[Errno 2] No such file or directory: '%s'" % path)
+    # We found the dataserver; now try to perform the stat
+    cmd=[XRD,dataserver,'stat',path]
+    try:
+        p=Popen(cmd,stdout=PIPE,stderr=STDOUT)
+        p.wait()
+    except:
+        fail(220,'Popen() failed for %s' % (' '.join(cmd)))
+
+    output=p.stdout.readlines()
+    if p.returncode:
+        fail(220,'statPathXroot(): xrd stat failed: %s' % (''.join(output)))
+
+    # Regular expression object to parse the expected output that should look like:
+    # Id: 614180388101 Size: 27 Flags: 51 Modtime: 1375892923
+    stats=re.compile('Id:\s+(-?\d+)\s+Size:\s+(\d+)\s+Flags:\s+(\d+)\s+Modtime:\s+(\d+)')
+    mystats={}
+    for line in output:
+        found=stats.match(line)
+        if found:
+            ID=int(found.group(1))
+            size=int(found.group(2))
+            flags=int(found.group(3))
+            modtime=int(found.group(4))
+            break
+    if found:
+        mystats['id'] = ID
+        mystats['size'] = size
+        mystats['flags'] = flags
+        mystats['mtime'] = modtime
+    else:
+        # locateall specified this dataserver
+        # but stat call didn't blow up BUT it did not 
+        # provide a stat line
+        #
+        fail(220,'xrd stat failed: No stat information found')
+    return mystats
+####################################################################################
+# adler32(fname)
+# get the adler32 checksum of a file named by fname
+# 
+# The adler32 checksum is done by calling the xrdadler32 program provided
+# with Xrootd, the path to xrdadler32 is taken from the lsmconfig module.
+# The xrdadler32 program can operate on both local and remote files, provided
+# that XRD_VMP is set correctly. Remote checksums should take place on the
+# the hosting dataserver.
+# 
+def adler32(fname):
+    # Call xrdadler32
+    # if it fails for any reason, return an error to pilot
+    # Some OS errors may cause an exception
+    #
+    cmd=[XRDADLER32, fname]
+    try:
+        p=Popen(cmd,stdout=PIPE, stderr=STDOUT)
+        p.wait()
+    except:
+        # Couldn't run the commmand 
+        # How should I complain
+        # Bail 
+        fail(200,'Popen failed for command: %s' % (' '.join(cmd)))
+
+    output=p.stdout.read()
+    if p.returncode != 0:
+        log('xrdadler failed for: %s: reason: %s' % (fname,output))
+        fail(200,msg='failed xrdadler32 for %s'% (fname) ) 
+    else:
+        try:
+            #should be one line of output; chksum value is first token
+            fields=output.split()
+            checksum=fields[0].lower()
+        except:
+            fail(200,'xrdadler32 bad output: %s' % output)
+        return checksum
+
+####################################################################################
+# md5sum(fname)
+# compute the md5 hash of a file named by fname
+#
+# The md5sum is computed by reading the file in 4K chunks and feeding it to the 
+# checksum algorithm.
+# Local files are read directly.
+# Remote files are essentially read back from storage via xrdcp
+# and the checksum occurs on the worker node.
+#
+def md5sum(fname):
+    checksum=hashlib.md5()
+    BLOCKSIZE = 4096
+    # If the path starts with the base xrootd storage path,
+    # the file is considered remote
+    # perform an xrdcp to stdout and compute the md5sum
+    # from the standard output.
+    if fname.startswith(DFPATH):
+        cmd=[XRDCP, '-s', 'root://%s/%s'%(RDR, fname), '-']
+        f=Popen(cmd,bufsize=BLOCKSIZE, stdout=PIPE).stdout
+    else:
+        #local file, simply read it.
+        f = open(fname,'r')
+    while True:
+        data=f.read(BLOCKSIZE)
+        if not data:
+            break
+        checksum.update(data)
+    f.close()
+    return checksum.hexdigest().lower()
+
+####################################################################################
+# log(msg)
+# put the contents of msg into a log file with a timestamp and process ID
+#
+# The location of the log file is dictated by the LOGDIR variable in the
+# configuration file
+#
+def log(msg):
+    LOGFILE=LOGDIR+'/lsm-get.log'
+    try:
+        f=open(LOGFILE, 'a')
+        f.write("%s %s %s\n" % (time.ctime(), os.getpid(), msg))
+        f.close()
+        os.chmod(LOGFILE, 0666)
+    except:
+        pass
+
+####################################################################################
+# fail(code,msg)
+# exit the program with return value of code and print msg on standard output
+#
+# The msg is also recorded in the log file
+#
+def fail(errorcode=200,msg=None):
+    if msg:
+        msg='%s %s'%(errorcode, msg)
+    else:
+        msg=str(errorcode)
+    print msg
+    log(msg)
+    #
+    # Program execution does not stop with this call
+    # Python raises an exception that might get caught higher up
+    sys.exit(errorcode)
+
+####################################################################################
+# pcacheCopy(src,dest)
+# copy a file from src to dest using the pcache.py script
+# UNTESTED!!!!
+#
+def pcacheCopy(src,dest):
+    cmd = "pcache.py -t 900 -r 2 dccp -X-io-queue=fast %s %s 2>&1" % (src, dest)
+
+    p = os.popen(cmd)
+    output = p.read()
+    if output:
+        log(output)
+    status = p.close()
+
+    if status:
+        ##Transfer failed.  Could retry, but that's already
+        ## done inside of pcache
+        if os.path.exists(dest):
+            try:
+                os.unlink(dest)
+            except:
+                pass
+        fail(201, "Copy command failed")
+
+    if not os.path.exists(dest):
+        fail(201, "Copy command failed")
+
+####################################################################################
+# xrootdCopy(src,dest)
+# copy a file from src to dest using xrdcp executable 
+#
+# At most, two attempts are made to transfer the file 
+#
+def xrootdCopy(src,dest):
+    srcURL="root://%s/%s" %(RDR,src)
+    cmd=[XRDCP, '-s', srcURL, dest]
+    count=0
+    while count < 2:
+        try:
+            p=Popen(cmd,stdout=PIPE, stderr=STDOUT)
+            p.wait()
+        except:
+            fail(220,'Popen failed for command:%s' %(' '.join(cmd)))
+
+        output=p.stdout.read()
+        if output:
+            log(output)
+        if p.returncode:
+            # we failed, try again
+            if os.path.exists(dest):
+                try:
+                    os.unlink(dest)
+                except:
+                    pass
+            if count == 0:
+                count = count + 1
+                continue
+            fail(201, "Copy command failed:%s" %(output))
+        else:
+            break
+    #
+    # Not sure I need this test here
+    #
+    if not os.path.exists(dest):
+        fail(201, "Copy command failed")
+
+
+################################################################################################
+if __name__ == '__main__':
+    log(' '.join(sys.argv))
+    #
+    # Where to put this?
+    #
+    PCACHE=False
+
+    parser=optparse.OptionParser()
+    parser.add_option("-t", dest="token")
+    parser.add_option("--size", dest="size", type="int")
+    parser.add_option("--checksum", dest="chksum", type="string")
+    parser.add_option("--guid", dest="guid", type="string")
+
+    (options,args)=parser.parse_args()
+
+    if len(args) == 2:
+        idx=args[0].find(DFPATH)
+        if idx >-1:
+            src=args[0][idx:]
+        else:
+            fail(203,'Bad source URL')
+        dest=args[1]
+    else:
+        fail(203,'Wrong number of args')
+
+    csum_type = 'md5'
+    csum_value = None
+
+    # Do I really need to checks the source checkusm?
+    # if checksum is provided, just verify that destination has the 
+    # correct checksum
+    #  
+    #  --checksum md5:VAL  (check destination only)
+    #  --checksum adler32:VAL  (check destination only)
+    #  --checksum ad:VAL (check destination only)
+    #  --checksum VAL (check destination only, use MD5)
+    #  --checksum  (NOT ALLOWED)
+    #  no checksum (check source, destination?) (use adler32)
+
+    if options.chksum:
+        cfields=options.chksum.split(":")
+        if len(cfields) == 1:
+            # --checksum VAL
+            csum_type = "md5"
+            csum_value = options.chksum
+        elif len(cfields) == 2:
+            csum_type = cfields[0].lower()
+            if csum_type == 'md5' or csum_type == 'adler32':
+                #  --checksum md5:VAL
+                #  --checksum adler32:VAL
+                pass 
+            elif csum_type == 'ad':
+                #  --checksum ad:VAL
+                csum_type='adler32'
+            else:
+                # not md5,adler32,ad
+                fail(203,'Bad checksum type')
+            csum_value = cfields[1]
+        else:
+            # something that has multiple ":"
+            fail(203,'Bad checksum value')
+    else:
+        csum_value = adler32(src)
+        csum_type = 'adler32'
+
+    if csum_type == 'md5':
+        checksumfunc=md5sum
+    else:
+        checksumfunc=adler32
+
+    size=None
+    if options.size:
+        try:
+            size=int(options.size)
+        except:
+            fail(203,'Bad file size')
+    else:
+        try:
+            mystat=statPath(src)
+            size=mystat.size()
+        except OSError:
+            #Source file wasn't there
+            fail(200,"Source file not found")
+
+
+
+    if os.path.isdir(dest) and not dest.endswith('/'):
+        dest += '/'
+
+    #if destination provided look like a directory
+    # the real destination should be directory/file
+    if dest.endswith('/'):
+        basename = src.split('/')[-1]
+        dest += basename
+    
+    if os.path.exists(dest):
+        fail(212, "%s: File exists" % dest)
+
+    dirname, filename = os.path.split(dest)
+    if not os.path.exists(dirname):
+        try:
+            os.makedirs(dirname,PERM_DIR)
+        except:
+            pass
+
+    if not os.path.exists(dirname):
+        fail(206, "Cannot create %s" % dirname)
+
+    # Ready to copy?
+    if PCACHE:
+        pcacheCopy(src,dest)
+    else:
+        xrootdCopy(src,dest)
+    try:
+        os.chmod(dest, PERM_FILE)
+    except:
+        #Should this fail?
+        pass
+
+## Verify size/checksum if asked for
+    if size:
+        try:
+            destStat=statPath(dest)
+            fsize=destStat.size()
+        except:
+            fsize = "UNKNOWN"
+        if size != fsize:
+            fail(204, "Size mismatch %s!=%s"%(fsize,size))
+
+    if csum_value:
+        try:
+            fchecksumval = checksumfunc(dest)
+        except:
+            fchecksumval = "UNKNOWN"
+        if fchecksumval != csum_value:
+            fail(205, "Checksum mismatch %s!=%s"%(fchecksumval, csum_value))
+        
+    log("0 OK")
